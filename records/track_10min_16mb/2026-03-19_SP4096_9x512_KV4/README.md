@@ -1,18 +1,27 @@
-# SP4096: Larger Vocabulary for Better Bits-Per-Byte
+# SP4096: Larger Vocabulary + Int6 Quantization for Better BPB
 
 ## Summary
 
-Switching from the baseline's 1024-token SentencePiece BPE vocabulary to a 4096-token vocabulary yields a significant BPB improvement. The larger vocabulary compresses text 26% more efficiently (0.306 vs 0.414 tokens/byte). Combined with untied embeddings (separate input/output), the model achieves 14% better BPB in preliminary single-GPU tests.
+**val_bpb = 1.2012** | **Artifact: 14,342,773 bytes** (under 16MB)
 
-## Approach
+Two improvements stacked on the baseline:
 
-The key insight is that BPB = (val_loss / ln2) * tokens_per_byte. A better tokenizer directly reduces the tokens_per_byte multiplier. While a larger vocabulary increases per-token cross-entropy (harder prediction task), the compression gain more than compensates.
+1. **SP4096 tokenizer** -- SentencePiece BPE with vocab_size=4096 compresses text 26% more efficiently than the baseline sp1024 (0.306 vs 0.414 tokens/byte). Better compression directly reduces the tokens_per_byte multiplier in BPB.
 
-**Tokenizer training:** SentencePiece BPE trained on 500K FineWeb documents with vocab_size=4096, byte_fallback=True, split_digits=True, nmt_nfkc normalization.
+2. **Int6 quantization + zstd** -- Per-row int6 quantization ([-31,31]) with STE fake quantization during training, fp16 embedding passthrough, and zstd-22 compression. Saves ~3MB vs int8+zlib, fitting the larger vocabulary model under 16MB.
 
-**Compression ratio:** 0.306 tokens/byte vs 0.414 for the baseline sp1024 (26% fewer tokens for the same text).
+Additional tuning: NorMuon optimizer, halved learning rates (matrix=0.02, scalar=0.02, embed=0.03), extended warmdown (3000 iterations), higher Muon momentum (0.99).
 
-**Untied embeddings:** Separating input embeddings (lr=0.6) from the output head (lr=0.008) improves BPB over tied embeddings, despite the extra parameter cost. The compressed model (15.0MB) fits under the 16MB limit.
+## Key Metrics
+
+| Metric | Value |
+|--------|-------|
+| **val_bpb (post-quant)** | **1.2012** |
+| Pre-quant val_bpb | 1.2012 |
+| Artifact size | 14,342,773 bytes |
+| Training steps | 11,497 (wallclock-limited) |
+| Step avg | 52.1ms |
+| Hardware | 8xH100 SXM 80GB (RunPod) |
 
 ## Configuration
 
@@ -23,57 +32,42 @@ MODEL_DIM=512
 NUM_HEADS=8
 NUM_KV_HEADS=4
 MLP_MULT=2
-TIE_EMBEDDINGS=0
+TIE_EMBEDDINGS=1
 TRAIN_SEQ_LEN=1024
 TRAIN_BATCH_TOKENS=524288
+MATRIX_LR=0.02
+SCALAR_LR=0.02
+TIED_EMBED_LR=0.03
+MUON_MOMENTUM=0.99
+MUON_MOMENTUM_WARMUP_START=0.92
+MUON_MOMENTUM_WARMUP_STEPS=1500
+WARMDOWN_ITERS=3000
 ```
 
-All other hyperparameters are default (same as baseline).
+## Tokenizer
 
-## Results
+SentencePiece BPE trained on 500K FineWeb documents with byte_fallback=True, split_digits=True, nmt_nfkc normalization. Tokenizer model included in the submission artifact.
 
-**Status: Work in progress. Awaiting 8xH100 validation run.**
-
-### RTX 5090 (1xGPU, 10 min) -- Preliminary
-
-| Config | Steps | val_bpb (post-quant) | Compressed |
-|--------|-------|---------------------|------------|
-| sp1024 baseline (control) | 457 | 1.5086 | 9.8MB |
-| sp4096, tied | 938 | 1.3217 | 13.6MB |
-| sp4096, 10L tied | 849 | 1.3259 | 14.6MB |
-| **sp4096, untied (best)** | **939** | **1.2970** | **15.0MB** |
-
-Improvement: -0.212 BPB (14.0% better) vs sp1024 baseline on single GPU.
-
-Note: Single GPU results are not directly comparable to the 8xH100 leaderboard due to fewer training steps. The 8xH100 run will complete ~13K+ steps vs 939 on 1xGPU.
-
-### Tokenizer Compression Analysis
-
-| Tokenizer | Vocab | tokens_per_byte |
-|-----------|-------|----------------|
-| sp1024 BPE (baseline) | 1024 | 0.414 |
-| sp2048 BPE | 2048 | 0.351 |
-| **sp4096 BPE (ours)** | **4096** | **0.306** |
-| sp8192 BPE | 8192 | 0.272 |
-
-## Reproducing
-
-Tokenizer and pre-tokenized dataset will be uploaded to HuggingFace (link TBD).
+Tokenizer and pre-tokenized dataset available from the author on request.
 
 ## Command
 
 ```bash
+pip install zstandard
+NCCL_IB_DISABLE=1 \
 VOCAB_SIZE=4096 \
-TIE_EMBEDDINGS=0 \
-DATA_PATH=./data/datasets/fineweb10B_sp4096 \
-TOKENIZER_PATH=./data/tokenizers/fineweb_4096_bpe.model \
+TIE_EMBEDDINGS=1 \
+DATA_PATH=./data/export_sp4096/datasets/fineweb10B_sp4096 \
+TOKENIZER_PATH=./data/export_sp4096/tokenizers/fineweb_4096_bpe.model \
 MAX_WALLCLOCK_SECONDS=600 \
+VAL_LOSS_EVERY=200 \
+TRAIN_LOG_EVERY=50 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
 ## Included Files
 
-- `train_gpt.py` -- training script (unmodified from baseline)
+- `train_gpt.py` -- training script with int6+zstd quantization, STE QAT, NorMuon
 - `submission.json` -- leaderboard metadata
 - `README.md` -- this file
-- `train.log` -- (pending 8xH100 run)
+- `train.log` -- full training log from 8xH100 run
